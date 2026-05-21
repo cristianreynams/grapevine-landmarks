@@ -1,0 +1,37 @@
+# Data directories (user-provided images and generated outputs)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug images (generated during development)
+*.png
+*.jpg
+*.jpeg
+
+# Keep directory structure for examples
+data/raw/.gitkeep
+data/processed/.gitkeep
