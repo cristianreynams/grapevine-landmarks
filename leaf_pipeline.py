@@ -257,6 +257,11 @@ def all_dataset_pixel2cm_dir():
     return OUTPUT_ROOT / ALL_DATASET_NAME / "pixel2cm"
 
 
+def all_dataset_csv_dir():
+    """Return the consolidated CSV output directory."""
+    return OUTPUT_ROOT / ALL_DATASET_NAME / "csv"
+
+
 # ======================================================
 # UTILS
 # ======================================================
@@ -1313,7 +1318,8 @@ def landmark_images():
     All varieties (batch):
         --input all-dataset --from-cropped
         -> reads from data/processed/all_dataset/cropped/
-           writes to data/processed/all_dataset/landmarks/
+           writes images to data/processed/all_dataset/landmarks/
+           writes CSV  to data/processed/all_dataset/csv/
     """
 
     if is_all_dataset():
@@ -1348,7 +1354,10 @@ def landmark_images():
         output_dir = all_dataset_landmarks_dir()
         ensure_dir(output_dir)
 
-        csv_path = output_dir / "landmarks.csv"
+        csv_dir = all_dataset_csv_dir()
+        ensure_dir(csv_dir)
+
+        csv_path = csv_dir / "landmarks.csv"
 
         print(
             f"\n=== BATCH LANDMARKS ==="
@@ -1357,7 +1366,10 @@ def landmark_images():
             f"Input:  {cropped_dir}"
         )
         print(
-            f"Output: {output_dir}"
+            f"Images: {output_dir}"
+        )
+        print(
+            f"CSV:    {csv_dir}"
         )
         print(
             f"Images: {len(image_files)}\n"
@@ -1392,9 +1404,16 @@ def landmark_images():
             "landmarks"
         )
 
-        ensure_dir(output_dir)
+        csv_dir = (
+            OUTPUT_ROOT /
+            args.input /
+            "csv"
+        )
 
-        csv_path = output_dir / "landmarks.csv"
+        ensure_dir(output_dir)
+        ensure_dir(csv_dir)
+
+        csv_path = csv_dir / "landmarks.csv"
 
         image_files = get_image_files()
 
@@ -1519,7 +1538,7 @@ def pixel2cm_images():
     All varieties (batch):
         --input all-dataset --from-cropped
         -> reads from data/processed/all_dataset/cropped/
-           writes to data/processed/all_dataset/pixel2cm/
+           writes CSVs to data/processed/all_dataset/csv/
     """
 
     if is_all_dataset():
@@ -1554,8 +1573,11 @@ def pixel2cm_images():
         output_dir = all_dataset_pixel2cm_dir()
         ensure_dir(output_dir)
 
-        csv_summary = output_dir / "pixel2cm.csv"
-        csv_detail = output_dir / "pixel2cm_detail.csv"
+        csv_dir = all_dataset_csv_dir()
+        ensure_dir(csv_dir)
+
+        csv_summary = csv_dir / "pixel2cm.csv"
+        csv_detail = csv_dir / "pixel2cm_detail.csv"
 
         print(
             f"\n=== BATCH PIXEL2CM ==="
@@ -1564,7 +1586,7 @@ def pixel2cm_images():
             f"Input:  {cropped_dir}"
         )
         print(
-            f"Output: {output_dir}"
+            f"CSV:    {csv_dir}"
         )
         print(
             f"Images: {len(image_files)}\n"
@@ -1613,10 +1635,17 @@ def pixel2cm_images():
             "pixel2cm"
         )
 
-        ensure_dir(output_dir)
+        csv_dir = (
+            OUTPUT_ROOT /
+            args.input /
+            "csv"
+        )
 
-        csv_summary = output_dir / "pixel2cm.csv"
-        csv_detail = output_dir / "pixel2cm_detail.csv"
+        ensure_dir(output_dir)
+        ensure_dir(csv_dir)
+
+        csv_summary = csv_dir / "pixel2cm.csv"
+        csv_detail = csv_dir / "pixel2cm_detail.csv"
 
         image_files = get_image_files()
 
