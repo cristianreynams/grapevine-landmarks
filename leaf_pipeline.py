@@ -12,6 +12,8 @@ except ImportError:
     subprocess.run(["pip", "install", "scikit-image", "-q"], check=True)
     from skimage.morphology import skeletonize as sk_skeletonize
 
+from tqdm import tqdm
+
 
 # ======================================================
 # CLI
@@ -579,18 +581,22 @@ def _crop_and_save(image_path, output_dir, debug_dir,
         2
     )
 
+    # Ensure .png extension for saved crops
+    stem = Path(image_path.name).stem
+    png_name = f"{name_prefix}{stem}.png"
+
     ensure_dir(debug_dir)
 
     cv2.imwrite(
-        str(debug_dir / f"{name_prefix}{image_path.name}"),
+        str(debug_dir / png_name),
         debug
     )
 
     # ==================================================
-    # SAVE CROPPED IMAGE
+    # SAVE CROPPED IMAGE (PNG, lossless)
     # ==================================================
 
-    save_path = output_dir / f"{name_prefix}{image_path.name}"
+    save_path = output_dir / png_name
 
     cv2.imwrite(str(save_path), cropped)
 
@@ -666,7 +672,13 @@ def crop_images():
                 f"  {variety}: {len(image_files)} images"
             )
 
-            for image_path in image_files:
+            for image_path in tqdm(
+                image_files,
+                desc=f"  {variety}",
+                unit="img",
+                ncols=80,
+                leave=True,
+            ):
                 prefix = f"{variety}_"
                 _crop_and_save(
                     image_path,
@@ -704,7 +716,13 @@ def crop_images():
             f"\nFound {len(image_files)} images"
         )
 
-        for image_path in image_files:
+        for image_path in tqdm(
+            image_files,
+            desc=f"  {args.input}",
+            unit="img",
+            ncols=80,
+            leave=True,
+        ):
             _crop_and_save(
                 image_path,
                 output_dir,
@@ -1379,7 +1397,13 @@ def landmark_images():
             "image,variedad,landmark_id,landmark,x,y,px_per_cm"
         ]
 
-        for image_path in image_files:
+        for image_path in tqdm(
+            image_files,
+            desc="Landmarks",
+            unit="img",
+            ncols=80,
+            leave=True,
+        ):
             _process_landmarks(
                 image_path,
                 output_dir,
@@ -1432,7 +1456,13 @@ def landmark_images():
             "image,variedad,landmark_id,landmark,x,y,px_per_cm"
         ]
 
-        for image_path in image_files:
+        for image_path in tqdm(
+            image_files,
+            desc="Landmarks",
+            unit="img",
+            ncols=80,
+            leave=True,
+        ):
             _process_landmarks(
                 image_path,
                 output_dir,
@@ -1604,7 +1634,13 @@ def pixel2cm_images():
             "px_per_cm,is_outlier"
         ]
 
-        for image_path in image_files:
+        for image_path in tqdm(
+            image_files,
+            desc="Pixel2cm",
+            unit="img",
+            ncols=80,
+            leave=True,
+        ):
             _process_pixel2cm(
                 image_path,
                 summary_lines,
@@ -1672,7 +1708,13 @@ def pixel2cm_images():
             "px_per_cm,is_outlier"
         ]
 
-        for image_path in image_files:
+        for image_path in tqdm(
+            image_files,
+            desc="Pixel2cm",
+            unit="img",
+            ncols=80,
+            leave=True,
+        ):
             _process_pixel2cm(
                 image_path,
                 summary_lines,
