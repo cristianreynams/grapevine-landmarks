@@ -160,6 +160,7 @@ def main():
         )
 
     current_image_index = 0
+    _updating = False  # recursion guard
 
     # ---- Progress helpers ----
     def image_progress_str():
@@ -235,9 +236,17 @@ def main():
     # ---- Point change callback ----
     @points_layer.events.data.connect
     def on_points_change(event):
+        nonlocal _updating
+        if _updating:
+            return
         n = len(points_layer.data)
         if n > MAX_POINTS:
+            _updating = True
             points_layer.data = points_layer.data[:MAX_POINTS]
+            _updating = False
+            refresh_annotations()
+            update_title()
+            update_landmark_progress_widget()
             print(f"  Max {MAX_POINTS} points reached.")
             return
         refresh_annotations()
@@ -250,7 +259,7 @@ def main():
 
     # ---- Load existing landmarks ----
     def load_landmarks_for_image(image_path):
-        nonlocal master_df
+        nonlocal master_df, _updating
         if master_df.empty:
             return False
         rows = master_df[master_df["image_name"] == image_path.name]
@@ -262,7 +271,9 @@ def main():
         rows["_order"] = rows["landmark"].map({name: i for i, name in enumerate(LANDMARK_NAMES)})
         rows = rows.sort_values("_order").drop(columns=["_order"])
         pts = np.array([[row["y"], row["x"]] for _, row in rows.iterrows()])
+        _updating = True
         points_layer.data = pts
+        _updating = False
         refresh_annotations()
         update_title()
         update_landmark_progress_widget()
@@ -300,7 +311,7 @@ def main():
     # ---- Navigation ----
     @magicgui(call_button="Save + Next")
     def save_next():
-        nonlocal current_image_index
+        nonlocal current_image_index, _updating
         if not save_current_landmarks():
             return
         current_image_index += 1
@@ -312,14 +323,16 @@ def main():
         viewer.reset_view()
         loaded = load_landmarks_for_image(nxt)
         if not loaded:
+            _updating = True
             points_layer.data = np.empty((0, 2))
+            _updating = False
         update_title()
         update_landmark_progress_widget()
         print(f"\n  {image_progress_str()}  |  [{'loaded' if loaded else 'new'}] {nxt.name}")
 
     @magicgui(call_button="Previous Image")
     def go_previous():
-        nonlocal current_image_index
+        nonlocal current_image_index, _updating
         if current_image_index <= 0:
             print("\n  Already at first image.")
             return
@@ -329,7 +342,9 @@ def main():
         viewer.reset_view()
         loaded = load_landmarks_for_image(prev)
         if not loaded:
+            _updating = True
             points_layer.data = np.empty((0, 2))
+            _updating = False
         update_title()
         update_landmark_progress_widget()
         print(f"\n  {image_progress_str()}  |  [{'loaded' if loaded else 'new'}] {prev.name}")
