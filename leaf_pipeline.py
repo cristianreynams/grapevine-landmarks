@@ -81,20 +81,9 @@ parser.add_argument(
     ),
 )
 
-args = parser.parse_args()
-
-
-# Validate --input for modes that require it
-_modes_needing_input = [
-    "crop",
-    "landmark",
-    "pixel2cm",
-]
-
-if args.mode in _modes_needing_input and not args.input:
-    parser.error(
-        f"--input is required for --mode {args.mode}"
-    )
+# args is parsed only when running as a script (see __main__ block)
+# Functions that need args should handle the case where args is None
+args = None  # placeholder, set in __main__
 
 
 # ======================================================
@@ -113,6 +102,10 @@ def get_input_dir():
     Default:    data/raw/{input}
     --from-cropped: data/processed/{input}/cropped
     """
+    global args
+
+    if args is None:
+        return Path("data/raw")
 
     if args.from_cropped:
         return (
@@ -127,7 +120,17 @@ def get_input_dir():
     )
 
 
-INPUT_DIR = get_input_dir()
+# Lazy initialization — INPUT_DIR is computed on first use, not at import time
+INPUT_DIR = None
+
+
+def _get_input_dir_lazy():
+    """Return INPUT_DIR, initializing on first call."""
+    global INPUT_DIR
+    if INPUT_DIR is None:
+        INPUT_DIR = get_input_dir()
+    return INPUT_DIR
+
 
 LANDMARK_CSV = Path(
     "output/debug_landmarks.csv"
@@ -227,6 +230,9 @@ ALL_DATASET_NAME = "all_dataset"
 
 def is_all_dataset():
     """Check if the user requested processing all varieties."""
+    global args
+    if args is None:
+        return False
     return args.input == ALL_DATASET_ALIAS
 
 
@@ -277,11 +283,8 @@ def ensure_dir(path):
 
 
 def get_image_files():
-
     return sorted([
-
-        p for p in INPUT_DIR.iterdir()
-
+        p for p in _get_input_dir_lazy().iterdir()
         if p.suffix.lower() in [
             ".jpg",
             ".jpeg",
@@ -912,18 +915,39 @@ def measure_pixel2cm(image_bgr, leaf_mask=None, n_lines=10):
 # LANDMARK DETECTION
 # ======================================================
 
-def _find_lowest_moderate(points, pec_x, w):
-    """Find lowest point with moderate lateral distance from center."""
-    lateral = np.abs(points[:, 0] - pec_x)
-    ideal_lateral = w * 0.22
-    scores = points[:, 1] * 1.0 - np.abs(lateral - ideal_lateral) * 0.8
-    return tuple(points[np.argmax(scores)])
+# ======================================================
+# LANDMARK DETECTION — 5-Stage Pipeline
+#
+# Each landmark has its own function with isolated config.
+# Adjusting one stage does NOT affect others.
+# ======================================================
+
+# ---- Stage 1: PECIOLE SINUS ----
+# Tunable parameters for find_peciole_sinus()
+PEC_DEFECT_DEPTH_THRESHOLD = 60    # px: U-notch vs skeleton decision
+PEC_LOWER_Y_FACTOR = 0.6           # fraction of cy: lower half search
+PEC_CENTER_BAND = 0.2              # fraction of w: horizontal search band
+PEC_REFINE_STEPS = 25              # max refinement steps for v8
+PEC_REFINE_STEP = 3                # px: refinement step size
+PEC_SKELETON_BAND = 0.033          # fraction of w: midrib search band
 
 
-def _find_peciolar(image_bgr, mask):
+def find_peciole_sinus(image_bgr, mask):
     """
-    Find the true petiolar sinus.
-    Hybrid: v8 contour-refined when U-notch visible, v9 midrib when hidden.
+    Stage 1: Find the petiolar sinus (PEC).
+
+    Hybrid approach:
+      - v8 (convexity defect): when U-notch is clearly visible
+      - v9 (skeleton endpoint): when lower lobes overlap (e.g. Tempranillo)
+
+    Parameters (module-level, tunable):
+      PEC_DEFECT_DEPTH_THRESHOLD: px threshold for v8 vs v9 decision
+      PEC_LOWER_Y_FACTOR: lower-half search region factor
+      PEC_CENTER_BAND: horizontal search band around center
+      PEC_REFINE_STEPS / PEC_REFINE_STEP: v8 refinement config
+      PEC_SKELETON_BAND: midrib skeleton search band
+
+    Returns: (x, y) of the PEC
     """
     h, w = image_bgr.shape[:2]
     M = cv2.moments(mask)
@@ -935,7 +959,7 @@ def _find_peciolar(image_bgr, mask):
     hull = cv2.convexHull(contour, returnPoints=False)
     defects = cv2.convexityDefects(contour, hull)
 
-    # v8: deepest defect in lower half
+    # --- v8: deepest convexity defect in lower half ---
     best_defect = None
     best_depth = 0
     if defects is not None:
@@ -943,28 +967,32 @@ def _find_peciolar(image_bgr, mask):
             s, e, f, d = defects[i, 0]
             far_pt = tuple(contour[f][0])
             depth = d / 256.0
-            if far_pt[1] > cy * 0.6 and abs(far_pt[0] - cx) < w * 0.2 and depth > best_depth:
+            if (far_pt[1] > cy * PEC_LOWER_Y_FACTOR and
+                    abs(far_pt[0] - cx) < w * PEC_CENTER_BAND and
+                    depth > best_depth):
                 best_depth = depth
                 best_defect = far_pt
 
     if best_defect is None:
         return (cx, int(cy + h * 0.25))
 
-    # Measure defect depth at v8
+    # Measure defect depth at v8 position
     contour_arr = contour.reshape(-1, 1, 2).astype(np.int32)
     dp = 0
     if defects is not None:
         for i in range(defects.shape[0]):
             s, e, f, d = defects[i, 0]
             fp = tuple(contour_arr[f][0])
-            if abs(fp[1] - best_defect[1]) + abs(fp[0] - best_defect[0]) * 0.5 < 80:
+            if (abs(fp[1] - best_defect[1]) +
+                    abs(fp[0] - best_defect[0]) * 0.5 < 80):
                 dp = max(dp, d / 256.0)
 
-    # v9: midrib endpoint (fallback for overlapping lobes)
+    # --- v9: midrib skeleton endpoint (fallback) ---
     from skimage.morphology import skeletonize as sk_skel
     skel = (sk_skel(mask > 0) * 255).astype(np.uint8)
-    band = max(20, w // 30)
-    center_pixels = [(x, y) for y in range(int(cy * 0.3), min(h, int(cy * 1.4)))
+    band = max(20, int(w * PEC_SKELETON_BAND))
+    center_pixels = [(x, y)
+                     for y in range(int(cy * 0.3), min(h, int(cy * 1.4)))
                      for x in range(max(0, cx - band), min(w, cx + band))
                      if skel[y, x] > 0]
     v9 = None
@@ -992,58 +1020,218 @@ def _find_peciolar(image_bgr, mask):
             if len(li) > 0:
                 v9 = (int(np.median([xs[i] for i in li])), int(ys.max()))
 
-    # Decision
-    if dp > 60:
-        # U-notch visible: use v8
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        leaf_m = cv2.inRange(hsv, LOWER_LEAF, UPPER_LEAF)
-        dist = cv2.distanceTransform(leaf_m, cv2.DIST_L2, 5)
+    # --- Decision: v8 (deep notch) or v9 (overlapping lobes) ---
+    if dp > PEC_DEFECT_DEPTH_THRESHOLD:
+        # U-notch visible: use convexity defect with optional
+        # refinement. For most leaves the defect point is already
+        # close to the true sinus. Only refine when the defect
+        # is very low (near the leaf bottom), suggesting a deep
+        # notch where the true sinus is higher up.
         bx, by = best_defect
-        bd = dist[by, bx] if 0 <= bx < w and 0 <= by < h else 0
-        result = best_defect
-        for step in range(1, 25):
-            sx = bx + int((cx - bx) / max(1, abs(cx - bx)) * 3) if cx != bx else bx
-            sy = by - 3
-            if 0 <= sx < w and 0 <= sy < h and leaf_m[sy, sx] > 0:
-                dv = dist[sy, sx]
-                if dv > 0 and dv <= bd:
-                    bd = dv
-                    result = (sx, sy)
-        return result
+
+        # Only refine if defect is very low (below 85% of height)
+        if by > h * 0.85:
+            hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+            leaf_m = cv2.inRange(hsv, LOWER_LEAF, UPPER_LEAF)
+            # Walk up in small steps, keep x fixed at defect
+            for step in range(1, 8):
+                sy = by - step * 4
+                if sy < int(cy * 0.5):
+                    break
+                if 0 <= sy < h and leaf_m[sy, bx] > 0:
+                    return (bx, sy)
+
+        return best_defect
     else:
-        # Overlapping lobes: use v9 or fallback
+        # Overlapping: use v9 or fallback
         if v9:
             return (int(v9[0] * 0.5 + cx * 0.5), v9[1])
         return best_defect
 
 
-def _find_lobe_tips(image_bgr, mask, pec):
+# ---- Stage 2: L1 (Top Lobe Tip) ----
+# Tunable parameters for find_L1()
+L1_CENTER_BAND = 0.12   # fraction of w: horizontal search band around PEC
+
+
+def find_L1(image_bgr, mask, pec):
     """
-    Find L1, L2, L3, L4 lobe tips using prominence-filtered peaks.
+    Stage 2: Find L1 — the top lobe tip.
+
+    Method: highest contour point within a horizontal band centered on PEC.
+
+    Parameters:
+      L1_CENTER_BAND: horizontal search band (fraction of image width)
+
+    Returns: (x, y) of L1, or None if not found
     """
     h, w = image_bgr.shape[:2]
+    pec_x = int(pec[0])
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour = max(contours, key=cv2.contourArea)
     contour_pts = contour.reshape(-1, 2)
+
+    band = w * L1_CENTER_BAND
+    center_mask = np.abs(contour_pts[:, 0] - pec_x) < band
+    top = contour_pts[center_mask]
+
+    if len(top) > 0:
+        return tuple(top[np.argmin(top[:, 1])])
+    return None
+
+
+# ---- Stage 3: L2 (Upper Lobe Tips) ----
+# Tunable parameters for find_L2()
+L2_SIDE_OFFSET = 30          # px: min horizontal distance from center
+L2_UPPER_Y_FACTOR = 1.0      # fraction: upper region cutoff (y < cy * factor)
+L2_PEAK_DISTANCE = 40        # px: min distance between peaks
+L2_PROMINENCE_FRACTION = 0.25  # fraction of max prominence to keep
+
+
+def find_L2(image_bgr, mask, pec, l1):
+    """
+    Stage 3: Find L2 left and right — upper lobe tips.
+
+    Method: prominence-filtered peaks in distance-from-PEC profile
+            for the upper half of each side of the contour.
+
+    Parameters:
+      L2_SIDE_OFFSET: min px from center to consider a point on a side
+      L2_UPPER_Y_FACTOR: y cutoff for upper region (fraction of cy)
+      L2_PEAK_DISTANCE: min px between peaks in find_peaks
+      L2_PROMINENCE_FRACTION: fraction of max prominence to filter peaks
+
+    Returns: dict with 'izq' and 'der' keys, each (x, y) or None
+    """
+    h, w = image_bgr.shape[:2]
     pec_x, pec_y = int(pec[0]), int(pec[1])
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    contour_pts = contour.reshape(-1, 2)
 
     M = cv2.moments(mask)
     cx = int(M['m10'] / M['m00'])
     cy = int(M['m01'] / M['m00'])
 
-    lobe_tips = {}
-
-    # L1: highest point near center
-    center_band = np.abs(contour_pts[:, 0] - pec_x) < w * 0.12
-    top = contour_pts[center_band]
-    if len(top) > 0:
-        lobe_tips['L1'] = tuple(top[np.argmin(top[:, 1])])
-
-    # Distance from PEC
-    dists = np.sqrt((contour_pts[:, 0] - pec_x) ** 2 + (contour_pts[:, 1] - pec_y) ** 2)
+    # Distance from PEC along contour
+    dists = np.sqrt((contour_pts[:, 0] - pec_x) ** 2 +
+                    (contour_pts[:, 1] - pec_y) ** 2)
     dists_smooth = uniform_filter1d(dists, size=7, mode='wrap')
 
+    result = {}
+
     for side in ['izq', 'der']:
+        if side == 'izq':
+            side_mask = contour_pts[:, 0] < cx - L2_SIDE_OFFSET
+        else:
+            side_mask = contour_pts[:, 0] > cx + L2_SIDE_OFFSET
+
+        pts = contour_pts[side_mask]
+        d_smooth = dists_smooth[side_mask]
+
+        if len(pts) < 3:
+            result[side] = None
+            continue
+
+        # Upper half region
+        upper_mask = pts[:, 1] < cy * L2_UPPER_Y_FACTOR
+        upper_pts = pts[upper_mask]
+        upper_d = d_smooth[upper_mask]
+
+        l2 = None
+        if len(upper_pts) > 0:
+            peaks, props = find_peaks(upper_d, distance=L2_PEAK_DISTANCE,
+                                      prominence=0)
+            if len(peaks) > 0:
+                max_prom = np.max(props['prominences'])
+                threshold = max_prom * L2_PROMINENCE_FRACTION
+                filtered = [p for i, p in enumerate(peaks)
+                            if props['prominences'][i] > threshold]
+                if filtered:
+                    peak_pts = [tuple(upper_pts[p]) for p in filtered]
+                    # L2 is a lateral lobe tip: it should be both high
+                    # (small y) AND far from center (lateral). Filter
+                    # out points that are too low, then score the rest.
+                    # L2 should be in upper 60% of the leaf (above cy*0.6)
+                    y_threshold = cy * 0.65
+                    valid_pts = [p for p in peak_pts if p[1] < y_threshold]
+                    if not valid_pts:
+                        valid_pts = peak_pts
+                    if side == 'izq':
+                        lateral_scores = [cx - p[0] for p in valid_pts]
+                    else:
+                        lateral_scores = [p[0] - cx for p in valid_pts]
+                    height_scores = [cy - p[1] for p in valid_pts]
+                    # Balance: laterality and height both matter
+                    combined = [
+                        lateral * 1.5 + height * 1.0
+                        for lateral, height in zip(lateral_scores, height_scores)
+                    ]
+                    l2 = valid_pts[int(np.argmax(combined))]
+
+        if l2 is None:
+            # Fallback: point with max lateral distance in upper half
+            upper = pts[pts[:, 1] < cy]
+            if len(upper) > 0:
+                if side == 'izq':
+                    l2 = tuple(upper[np.argmin(upper[:, 0])])
+                else:
+                    l2 = tuple(upper[np.argmax(upper[:, 0])])
+            else:
+                l2 = tuple(pts[np.argmin(pts[:, 1])])
+
+        result[side] = l2
+
+    return result
+
+
+# ---- Stage 4: L3 (Middle Lobe Tips) ----
+# Tunable parameters for find_L3()
+L3_BELOW_L2_OFFSET = 120  # px: min y distance below L2 (increased to avoid L2)
+L3_BELOW_PEC_MARGIN = 30  # px: max y distance above PEC
+L3_PEAK_DISTANCE = 30     # px: min distance between peaks
+L3_BELOW_L2_MIN = 80      # px: fallback min distance below L2
+
+
+def find_L3(image_bgr, mask, pec, l2_izq, l2_der):
+    """
+    Stage 4: Find L3 left and right — middle lobe tips.
+
+    Method: prominence-filtered peaks in the region between L2 and L4.
+            Uses dynamic search region based on L2 position and PEC.
+
+    Parameters:
+      L3_BELOW_L2_OFFSET: min px below L2 to start search
+      L3_BELOW_PEC_MARGIN: max px above PEC to end search
+      L3_PEAK_DISTANCE: min px between peaks in find_peaks
+      L3_BELOW_L2_MIN: fallback min px below L2
+
+    Returns: dict with 'izq' and 'der' keys, each (x, y) or None
+    """
+    h, w = image_bgr.shape[:2]
+    pec_x, pec_y = int(pec[0]), int(pec[1])
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    contour_pts = contour.reshape(-1, 2)
+
+    M = cv2.moments(mask)
+    cx = int(M['m10'] / M['m00'])
+    cy = int(M['m01'] / M['m00'])
+
+    dists = np.sqrt((contour_pts[:, 0] - pec_x) ** 2 +
+                    (contour_pts[:, 1] - pec_y) ** 2)
+    dists_smooth = uniform_filter1d(dists, size=7, mode='wrap')
+
+    result = {}
+
+    for side, l2 in [('izq', l2_izq), ('der', l2_der)]:
+        if l2 is None:
+            result[side] = None
+            continue
+
         if side == 'izq':
             side_mask = contour_pts[:, 0] < cx - 30
         else:
@@ -1053,74 +1241,158 @@ def _find_lobe_tips(image_bgr, mask, pec):
         d_smooth = dists_smooth[side_mask]
 
         if len(pts) < 3:
+            result[side] = None
             continue
 
-        # L2: prominence peak in upper half
-        upper_mask = pts[:, 1] < cy
-        upper_pts = pts[upper_mask]
-        upper_d = d_smooth[upper_mask]
-
-        l2 = None
-        if len(upper_pts) > 0:
-            peaks, props = find_peaks(upper_d, distance=40, prominence=0)
-            if len(peaks) > 0:
-                max_prom = np.max(props['prominences'])
-                filtered = [p for i, p in enumerate(peaks)
-                            if props['prominences'][i] > max_prom * 0.25]
-                if filtered:
-                    peak_pts = [tuple(upper_pts[p]) for p in filtered]
-                    l2 = min(peak_pts, key=lambda p: p[1])
-
-        if l2 is None:
-            l2 = tuple(pts[np.argmin(pts[:, 1])])
-
-        # L3: prominence peak between L2 and lower region
-        mid_mask = (pts[:, 1] > l2[1] + 80) & (pts[:, 1] < pec_y + 50)
+        # Search region: between L2 and PEC
+        mid_mask = ((pts[:, 1] > l2[1] + L3_BELOW_L2_OFFSET) &
+                    (pts[:, 1] < pec_y + L3_BELOW_PEC_MARGIN))
         mid_pts = pts[mid_mask]
         mid_d = d_smooth[mid_mask]
 
         l3 = None
         if len(mid_pts) > 0:
-            peaks, props = find_peaks(mid_d, distance=30, prominence=0)
+            peaks, props = find_peaks(mid_d, distance=L3_PEAK_DISTANCE,
+                                      prominence=0)
             if len(peaks) > 0:
-                best_peak = peaks[np.argmax(props['prominences'])]
-                l3 = tuple(mid_pts[best_peak])
+                # L3 is the "lower" lobe tip in the middle region.
+                # Among prominent peaks, prefer the one that is:
+                # 1. Low in the region (higher y = further from L2)
+                # 2. Has good prominence
+                peak_pts_list = [tuple(mid_pts[p]) for p in peaks]
+                prominences = props['prominences']
+                # Score: combine prominence with "low-ness"
+                scores = [
+                    prom * 1.0 + (pt[1] - l2[1]) * 0.5
+                    for prom, pt in zip(prominences, peak_pts_list)
+                ]
+                best_idx = int(np.argmax(scores))
+                l3 = peak_pts_list[best_idx]
 
+        # Fallback: point with max lateral distance between L2 and PEC
         if l3 is None:
-            mid = pts[(pts[:, 1] > l2[1] + 50) & (pts[:, 1] < pec_y)]
+            mid = pts[(pts[:, 1] > l2[1] + L3_BELOW_L2_MIN) &
+                      (pts[:, 1] < pec_y)]
             if len(mid) > 0:
                 lateral = np.abs(mid[:, 0] - cx)
                 l3 = tuple(mid[np.argmax(lateral)])
             else:
                 l3 = l2
 
-        # L4: lowest with moderate lateral distance
-        lower = pts[pts[:, 1] > cy + 50]
-        if len(lower) > 0:
-            l4 = _find_lowest_moderate(lower, pec_x, w)
+        result[side] = l3
+
+    return result
+
+
+# ---- Stage 5: L4 (Lower Lobe Tips) ----
+# Tunable parameters for find_L4()
+L4_LOWER_Y_OFFSET = 50    # px: min y distance below cy
+L4_IDEAL_LATERAL = 0.22   # fraction of w: ideal lateral distance
+L4_LATERAL_WEIGHT = 0.8   # weight for lateral distance in scoring
+
+
+def _score_l4_point(point, pec_x, ideal_lateral):
+    """Score a candidate L4 point: lowest with lateral distance close to ideal."""
+    lateral = np.abs(point[0] - pec_x)
+    # Score: high y (low position) rewarded, penalize deviation from ideal lateral
+    return point[1] * 1.0 - np.abs(lateral - ideal_lateral) * L4_LATERAL_WEIGHT
+
+
+def find_L4(image_bgr, mask, pec, l3_izq, l3_der):
+    """
+    Stage 5: Find L4 left and right — lower lobe tips.
+
+    Method: lowest contour point below the center, weighted by
+            proximity to an ideal lateral distance from PEC.
+
+    Parameters:
+      L4_LOWER_Y_OFFSET: min px below cy to consider
+      L4_IDEAL_LATERAL: ideal lateral distance (fraction of w)
+      L4_LATERAL_WEIGHT: weight for lateral distance penalty
+
+    Returns: dict with 'izq' and 'der' keys, each (x, y) or None
+    """
+    h, w = image_bgr.shape[:2]
+    pec_x = int(pec[0])
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    contour_pts = contour.reshape(-1, 2)
+
+    M = cv2.moments(mask)
+    cx = int(M['m10'] / M['m00'])
+    cy = int(M['m01'] / M['m00'])
+
+    result = {}
+
+    for side in ['izq', 'der']:
+        if side == 'izq':
+            side_mask = contour_pts[:, 0] < cx - 30
         else:
-            l4 = tuple(pts[np.argmax(pts[:, 1])])
+            side_mask = contour_pts[:, 0] > cx + 30
 
-        lobe_tips[f'L2_{side}'] = l2
-        lobe_tips[f'L3_{side}'] = l3
-        lobe_tips[f'L4_{side}'] = l4
+        pts = contour_pts[side_mask]
+        if len(pts) < 3:
+            result[side] = None
+            continue
 
-    return lobe_tips
+        # Points below center + offset
+        lower = pts[pts[:, 1] > cy + L4_LOWER_Y_OFFSET]
+        ideal_lateral = w * L4_IDEAL_LATERAL
+        if len(lower) > 0:
+            scores = np.array([_score_l4_point(p, pec_x, ideal_lateral) for p in lower])
+            result[side] = tuple(lower[np.argmax(scores)])
+        else:
+            result[side] = tuple(pts[np.argmax(pts[:, 1])])
 
+    return result
+
+
+# ======================================================
+# ORCHESTRATOR: detect_landmarks
+# ======================================================
 
 def detect_landmarks(image_bgr, leaf_mask):
     """
-    Automatically detect 8 key landmarks: PEC + L1/L2/L3/L4 (left/right).
-    Uses hybrid PEC detection + prominence-filtered lobe tip detection.
-    """
-    pec = _find_peciolar(image_bgr, leaf_mask)
-    lobe_tips = _find_lobe_tips(image_bgr, leaf_mask, pec)
+    Orchestrator: runs the 5-stage landmark detection pipeline.
 
+    Stage 1: find_peciole_sinus() → PEC
+    Stage 2: find_L1() → L1 (top tip)
+    Stage 3: find_L2() → L2_izq, L2_der (upper tips)
+    Stage 4: find_L3() → L3_izq, L3_der (middle tips)
+    Stage 5: find_L4() → L4_izq, L4_der (lower tips)
+
+    Each stage is independent — tuning one does not affect others.
+    """
+
+    # Stage 1: PEC
+    pec = find_peciole_sinus(image_bgr, leaf_mask)
     landmarks = {'seno_peciolar': pec}
 
-    for label in ['L1', 'L2_izq', 'L2_der', 'L3_izq', 'L3_der', 'L4_izq', 'L4_der']:
-        if label in lobe_tips:
-            landmarks[f'punta_{label}'] = lobe_tips[label]
+    # Stage 2: L1
+    l1 = find_L1(image_bgr, leaf_mask, pec)
+    if l1:
+        landmarks['punta_L1'] = l1
+
+    # Stage 3: L2
+    l2 = find_L2(image_bgr, leaf_mask, pec, l1)
+    for side in ['izq', 'der']:
+        if l2.get(side):
+            landmarks[f'punta_L2_{side}'] = l2[side]
+
+    # Stage 4: L3
+    l3 = find_L3(image_bgr, leaf_mask, pec,
+                 l2.get('izq'), l2.get('der'))
+    for side in ['izq', 'der']:
+        if l3.get(side):
+            landmarks[f'punta_L3_{side}'] = l3[side]
+
+    # Stage 5: L4
+    l4 = find_L4(image_bgr, leaf_mask, pec,
+                 l3.get('izq'), l3.get('der'))
+    for side in ['izq', 'der']:
+        if l4.get(side):
+            landmarks[f'punta_L4_{side}'] = l4[side]
 
     return landmarks
 
@@ -1741,20 +2013,27 @@ def pixel2cm_images():
 
 if __name__ == "__main__":
 
+    # Parse CLI args at runtime (not at import time)
+    args = parser.parse_args()
+
+    _modes_needing_input = [
+        "crop",
+        "landmark",
+        "pixel2cm",
+    ]
+
+    if args.mode in _modes_needing_input and not args.input:
+        parser.error(
+            f"--input is required for --mode {args.mode}"
+        )
+
     if args.mode == "crop":
-
         crop_images()
-
     elif args.mode == "landmark":
-
         landmark_images()
-
     elif args.mode == "pixel2cm":
-
         pixel2cm_images()
-
     elif args.mode == "all":
-
         crop_images()
         landmark_images()
         pixel2cm_images()
