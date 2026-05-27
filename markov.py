@@ -133,28 +133,23 @@ class GSLM:
                 cov = np.cov(datos.T) + np.eye(d) * self.lam
                 self.modelos[var][t] = {'mean': media, 'cov': cov}
     
-    def loglik(self, feat):
+    def _loglik_variedad(self, feat, var):
         """
-        Log-verosimilitud de una muestra bajo el modelo entrenado.
-        
-        L = sum_t w_t * log N(f_t | mu_t, Sigma_t)
+        Log-verosimilitud de una muestra bajo una variedad especifica.
+        Usado internamente por predict().
         """
         ll = 0.0
+        modelo = self.modelos.get(var)
+        if modelo is None:
+            return -np.inf
         for i, t in enumerate(self.transiciones):
             vec = np.array([feat[sf][t] for sf in self.features])
-            params = self.modelos[list(self.modelos.keys())[0]][t]
-            # Recompute per-variety
-            for v, modelo in self.modelos.items():
-                try:
-                    ll_v = self.weights[i] * multivariate_normal.logpdf(
-                        vec, modelo[t]['mean'], modelo[t]['cov']
-                    )
-                    ll += ll_v
-                    break  # Only add once per transition
-                except:
-                    pass
-            # Proper way: sum over all varieties' contributions
-            # Actually, we should compute per-variety likelihood in predict
+            try:
+                ll += self.weights[i] * multivariate_normal.logpdf(
+                    vec, modelo[t]['mean'], modelo[t]['cov']
+                )
+            except:
+                return -np.inf
         return ll
     
     def predict(self, features_list):
@@ -163,23 +158,11 @@ class GSLM:
         for feat in features_list:
             mejor_var = None
             mejor_ll = -np.inf
-            
-            for var, modelo in self.modelos.items():
-                ll = 0
-                for i, t in enumerate(self.transiciones):
-                    vec = np.array([feat[sf][t] for sf in self.features])
-                    try:
-                        ll += self.weights[i] * multivariate_normal.logpdf(
-                            vec, modelo[t]['mean'], modelo[t]['cov']
-                        )
-                    except:
-                        ll = -np.inf
-                        break
-                
+            for var in self.modelos.keys():
+                ll = self._loglik_variedad(feat, var)
                 if ll > mejor_ll:
                     mejor_ll = ll
                     mejor_var = var
-            
             predicciones.append(mejor_var)
         return predicciones
     
@@ -368,6 +351,15 @@ def permutation_test(features_list, varieties_list, var_idx,
     Permutation test: evalua si el accuracy es significativamente mayor
     que el azar bajo la hipotesis nula de independencia entre features y
     etiquetas.
+    
+    APROXIMACION COMPUTACIONAL:
+        Para eficiencia, se pre-computan las transiciones ANOVA sobre el
+        dataset real y se reutilizan para todas las permutaciones. Esto
+        NO replica el pipeline nested completo en cada permutacion
+        (que requeriria re-hacer ANOVA + seleccion + LOOCV 100 veces).
+        La aproximacion es ligeramente mas optimista que el nested full
+        pero computacionalmente viable. Los resultados se interpretan
+        con esta limitacion en mente.
     
     NOTA: Con n_perm=100, el p-value minimo resoluble es 1/101 ≈ 0.0099.
     No se puede justificar p < 0.0001 con solo 100 permutaciones.
