@@ -42,7 +42,7 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 # CONFIGURACION
 # ==============================================================================
-CSV_PATH = '/mnt/agents/upload/manual_landmarks.csv'
+CSV_PATH = 'data/processed/all_dataset/csv/manual_landmarks.csv'
 
 # Orden de los 14 landmarks anatomicos alrededor del contorno foliar
 LANDMARK_ORDER = [
@@ -420,11 +420,12 @@ def permutation_test(features_list, varieties_list, var_idx,
 
 
 # ==============================================================================
-# FUNCION: BASELINES
+# FUNCION: BASELINES (hibrido: sklearn si disponible, numpy puro como fallback)
 # ==============================================================================
 def run_baselines(X, y_str, labels):
     """
     Ejecuta clasificadores baseline para comparacion.
+    Usa sklearn si esta instalado; de lo contrario, implementacion numpy pura.
     
     NOTA: Los baselines usan el vector completo de 28 dimensiones
     (2 features x 14 transiciones), mientras que el GSLM selecciona
@@ -432,36 +433,117 @@ def run_baselines(X, y_str, labels):
     pipeline de seleccion de features constituye una limitacion del
     analisis comparativo.
     """
-    from sklearn.neighbors import KNeighborsClassifier
-    from sklearn.naive_bayes import GaussianNB
-    from sklearn.linear_model import LogisticRegression
+    try:
+        from sklearn.neighbors import KNeighborsClassifier
+        from sklearn.naive_bayes import GaussianNB
+        from sklearn.linear_model import LogisticRegression
+        HAS_SKLEARN = True
+    except ImportError:
+        HAS_SKLEARN = False
     
-    results = {'Random': (100.0 / len(labels), int(60 / len(labels)))}
+    n = len(X)
+    n_classes = len(labels)
+    results = {'Random': (100.0 / n_classes, int(n / n_classes))}
     
-    # K-NN
-    for k in [3, 5, 7]:
+    if HAS_SKLEARN:
+        # --- Version con sklearn (mas robusta) ---
+        for k in [3, 5, 7]:
+            corr = 0
+            for i in range(n):
+                knn = KNeighborsClassifier(n_neighbors=k)
+                knn.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
+                if knn.predict(X[i:i+1])[0] == y_str[i]: corr += 1
+            results[f'K-NN (k={k})'] = (corr / n * 100, corr)
+        
         corr = 0
-        for i in range(len(X)):
-            knn = KNeighborsClassifier(n_neighbors=k)
-            knn.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
-            if knn.predict(X[i:i+1])[0] == y_str[i]: corr += 1
-        results[f'K-NN (k={k})'] = (corr / 60 * 100, corr)
+        for i in range(n):
+            gnb = GaussianNB()
+            gnb.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
+            if gnb.predict(X[i:i+1])[0] == y_str[i]: corr += 1
+        results['Naive Bayes'] = (corr / n * 100, corr)
+        
+        corr = 0
+        for i in range(n):
+            try:
+                lr = LogisticRegression(max_iter=1000, multi_class='multinomial')
+            except TypeError:
+                lr = LogisticRegression(max_iter=1000)  # sklearn antiguo
+            lr.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
+            if lr.predict(X[i:i+1])[0] == y_str[i]: corr += 1
+        results['Logistic Reg'] = (corr / n * 100, corr)
     
-    # Naive Bayes
-    corr = 0
-    for i in range(len(X)):
-        gnb = GaussianNB()
-        gnb.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
-        if gnb.predict(X[i:i+1])[0] == y_str[i]: corr += 1
-    results['Naive Bayes'] = (corr / 60 * 100, corr)
-    
-    # Logistic Regression
-    corr = 0
-    for i in range(len(X)):
-        lr = LogisticRegression(max_iter=1000, multi_class='multinomial')
-        lr.fit(np.delete(X, i, 0), np.delete(y_str, i, 0))
-        if lr.predict(X[i:i+1])[0] == y_str[i]: corr += 1
-    results['Logistic Reg'] = (corr / 60 * 100, corr)
+    else:
+        # --- Version numpy pura (fallback sin dependencias) ---
+        print("      [sklearn no encontrado - usando implementacion numpy pura]")
+        
+        # K-NN manual
+        for k in [3, 5, 7]:
+            corr = 0
+            for i in range(n):
+                X_train = np.delete(X, i, axis=0)
+                y_train = np.delete(y_str, i, axis=0)
+                dists = np.sqrt(np.sum((X_train - X[i]) ** 2, axis=1))
+                knn_idx = np.argsort(dists)[:k]
+                knn_labels = y_train[knn_idx]
+                unique, counts = np.unique(knn_labels, return_counts=True)
+                pred = unique[np.argmax(counts)]
+                if pred == y_str[i]: corr += 1
+            results[f'K-NN (k={k})'] = (corr / n * 100, corr)
+        
+        # Naive Bayes gaussiano manual
+        corr = 0
+        for i in range(n):
+            X_train = np.delete(X, i, axis=0)
+            y_train = np.delete(y_str, i, axis=0)
+            classes = sorted(set(y_train))
+            log_probs = []
+            for c in classes:
+                X_c = X_train[y_train == c]
+                mu = X_c.mean(axis=0)
+                var = X_c.var(axis=0) + 1e-9
+                log_prior = np.log(len(X_c) / len(X_train))
+                log_likelihood = -0.5 * np.sum(np.log(2 * np.pi * var)) \
+                                 -0.5 * np.sum((X[i] - mu) ** 2 / var)
+                log_probs.append(log_prior + log_likelihood)
+            pred = classes[np.argmax(log_probs)]
+            if pred == y_str[i]: corr += 1
+        results['Naive Bayes'] = (corr / n * 100, corr)
+        
+        # Logistic Regression con gradient descent manual
+        def softmax(z):
+            if z.ndim == 1:
+                ez = np.exp(z - np.max(z))
+                return ez / np.sum(ez)
+            ez = np.exp(z - np.max(z, axis=1, keepdims=True))
+            return ez / np.sum(ez, axis=1, keepdims=True)
+        
+        def one_hot(y, classes):
+            Y = np.zeros((len(y), len(classes)))
+            for i, yi in enumerate(y):
+                Y[i, classes.index(yi)] = 1
+            return Y
+        
+        corr = 0
+        for i in range(n):
+            X_train = np.delete(X, i, axis=0)
+            y_train = np.delete(y_str, i, axis=0)
+            classes = sorted(set(y_train))
+            mu = X_train.mean(axis=0)
+            sigma = X_train.std(axis=0) + 1e-8
+            Xn = (X_train - mu) / sigma
+            xi = (X[i] - mu) / sigma
+            Xn_b = np.hstack([np.ones((len(Xn), 1)), Xn])
+            xi_b = np.hstack([1, xi])
+            Y = one_hot(y_train, classes)
+            d, C = Xn_b.shape[1], len(classes)
+            W = np.zeros((d, C))
+            for _ in range(500):
+                probs = softmax(Xn_b @ W)
+                grad = Xn_b.T @ (probs - Y) / len(Xn) + 0.01 * W
+                W -= 0.5 * grad
+            pred = classes[np.argmax(xi_b @ W)]
+            if pred == y_str[i]: corr += 1
+        results['Logistic Reg'] = (corr / n * 100, corr)
     
     return results
 
