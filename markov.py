@@ -40,7 +40,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# CONFIGURACION
+# CONFIGURACION INICIAL
 # ==============================================================================
 CSV_PATH = 'data/processed/all_dataset/csv/manual_landmarks.csv'
 
