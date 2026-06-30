@@ -4,12 +4,66 @@ from pathlib import Path
 from tqdm import tqdm
 from utils import ensure_dir
 
+def remove_grid(image_bgr):
+    """
+    Elimina las líneas horizontales y verticales de la cuadrícula mediante
+    morfología + inpainting.
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Resaltar líneas oscuras
+    blackhat = cv2.morphologyEx(
+        gray,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    )
+
+    _, bw = cv2.threshold(
+        blackhat,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Detectar líneas horizontales
+    horizontal = cv2.morphologyEx(
+        bw,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (31, 1))
+    )
+
+    # Detectar líneas verticales
+    vertical = cv2.morphologyEx(
+        bw,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 31))
+    )
+
+    grid = cv2.bitwise_or(horizontal, vertical)
+
+    grid = cv2.dilate(
+        grid,
+        np.ones((3,3), np.uint8),
+        iterations=1
+    )
+
+    repaired = cv2.inpaint(
+        image_bgr,
+        grid,
+        3,
+        cv2.INPAINT_TELEA
+    )
+
+    return repaired
+
 def detect_leaf_contour_mask(image_bgr):
     """
     Extracción de contorno mediante Índice de Pigmentación Híbrido y Recorte de Varianza.
     Inmune a líneas de cuadrícula (acromáticas) y robusto ante necrosis marginal.
     """
     # 1. Espacio LAB (Cromaticidad)
+    image_bgr = remove_grid(image_bgr)
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     _, a, b = cv2.split(lab)
     chroma = np.sqrt(np.square(a - 128.0) + np.square(b - 128.0))
@@ -34,13 +88,42 @@ def detect_leaf_contour_mask(image_bgr):
 
     # 5. Umbralización Adaptativa
     _, mask = cv2.threshold(pigment_equalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (5,5)
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
 
     # 6. Extracción estricta (Preservación topológica CHAIN_APPROX_NONE)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours: 
         return mask
         
     largest = max(contours, key=cv2.contourArea)
+    epsilon = 0.0008 * cv2.arcLength(largest, True)
+
+    largest = cv2.approxPolyDP(
+        largest,
+        epsilon,
+        True
+    )
     mask_clean = np.zeros_like(mask)
     cv2.drawContours(mask_clean, [largest], -1, 255, -1)
     

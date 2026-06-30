@@ -4,6 +4,7 @@ from mode_crop import run_crop
 from mode_contour import run_contour
 from mode_pixel2cm import run_pixel2cm
 from mode_landmark import run_landmark
+from mode_mask import run_mask
 
 def build_paths(args):
     is_all = (args.input == ALL_DATASET_ALIAS)
@@ -11,7 +12,7 @@ def build_paths(args):
 
     # Resolución estricta: contour, pixel2cm y landmark leen de cropped.
     # El crop lee del raw (DATA_ROOT).
-    if args.mode in ["contour", "landmark", "pixel2cm"] or args.from_cropped:
+    if args.mode in ["contour", "landmark", "pixel2cm", "mask"] or args.from_cropped:
         input_dir = OUTPUT_ROOT / project_name / "cropped"
     else:
         input_dir = DATA_ROOT / args.input if not is_all else DATA_ROOT
@@ -21,10 +22,11 @@ def build_paths(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Grape leaf processing pipeline.")
-    parser.add_argument("--mode", required=True, choices=["crop", "landmark", "pixel2cm", "contour", "all"])
+    parser.add_argument("--mode", required=True, choices=["crop", "landmark", "pixel2cm", "contour", "mask", "all"])
     parser.add_argument("--input", required=True, help="Input dataset (e.g., raw-pasini or all-dataset)")
     parser.add_argument("--output", default="", help="Output project name")
     parser.add_argument("--from-cropped", action="store_true", help="Force read from cropped directory")
+    parser.add_argument("--mask", action="store_true", help="Run mask mode after crop")
     
     args = parser.parse_args()
     
@@ -38,6 +40,8 @@ if __name__ == "__main__":
 
     if args.mode == "crop":
         run_crop(input_dir, base_output_dir, is_all, data_root=DATA_ROOT)
+    elif args.mode == "mask":
+        run_mask(input_dir, base_output_dir)
     elif args.mode == "contour":
         run_contour(input_dir, base_output_dir)
     elif args.mode == "pixel2cm":
